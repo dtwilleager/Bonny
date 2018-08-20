@@ -1,0 +1,650 @@
+#include "stdafx.h"
+#include "RenderTechnique.h"
+
+namespace Bonny
+{
+  RenderTechnique::RenderTechnique(string name, WorldManager* worldManager, HINSTANCE hinstance, HWND window, shared_ptr<Graphics> graphics):
+    m_name(name),
+    m_worldManager(worldManager),
+    m_hinstance(hinstance),
+    m_window(window),
+    m_graphics(graphics),
+    m_currentLight(0),
+    m_depthPrepass(false),
+    m_clusterData(nullptr),
+    m_freezeClusterEntity(false),
+    m_frameIndex(0)
+  {
+  }
+
+
+  RenderTechnique::~RenderTechnique()
+  {
+  }
+
+  void RenderTechnique::addRenderComponent(shared_ptr<RenderComponent> renderComponent, shared_ptr<Entity> entity)
+  {
+    m_renderComponents.push_back(renderComponent);
+    m_renderEntities.push_back(entity);
+  }
+
+  void RenderTechnique::removeRenderComponent(shared_ptr<RenderComponent> renderComponent, shared_ptr<Entity> entity)
+  {
+    for (vector<shared_ptr<RenderComponent>>::iterator it = m_renderComponents.begin(); it != m_renderComponents.end(); ++it)
+    {
+      if (*it == renderComponent)
+      {
+        m_renderComponents.erase(it);
+        return;
+      }
+    }
+
+    for (vector<shared_ptr<Entity>>::iterator it = m_renderEntities.begin(); it != m_renderEntities.end(); ++it)
+    {
+      if (*it == entity)
+      {
+        m_renderEntities.erase(it);
+        return;
+      }
+    }
+  }
+
+  void RenderTechnique::addLightComponent(shared_ptr<LightComponent> lightComponent, shared_ptr<Entity> entity)
+  {
+    m_lightComponents.push_back(lightComponent);
+    m_lightEntities.push_back(entity);
+  }
+
+  void RenderTechnique::removeLightComponent(shared_ptr<LightComponent> lightComponent, shared_ptr<Entity> entity)
+  {
+    for (vector<shared_ptr<LightComponent>>::iterator it = m_lightComponents.begin(); it != m_lightComponents.end(); ++it)
+    {
+      if (*it == lightComponent)
+      {
+        m_lightComponents.erase(it);
+        return;
+      }
+    }
+
+    for (vector<shared_ptr<Entity>>::iterator it = m_lightEntities.begin(); it != m_lightEntities.end(); ++it)
+    {
+      if (*it == entity)
+      {
+        m_lightEntities.erase(it);
+        return;
+      }
+    }
+  }
+
+  size_t RenderTechnique::getNumLightComponents()
+  {
+    return m_lightComponents.size();
+  }
+
+  shared_ptr<LightComponent> RenderTechnique::getLightComponent(uint32_t index)
+  {
+    return m_lightComponents[index];
+  }
+
+  void RenderTechnique::addView(shared_ptr<View> view)
+  {
+    m_views.push_back(view);
+    m_onscreenView = view;
+  }
+
+  void RenderTechnique::removeView(shared_ptr<View> view)
+  {
+    for (vector<shared_ptr<View>>::iterator it = m_views.begin(); it != m_views.end(); ++it)
+    {
+      if (*it == view)
+      {
+        m_views.erase(it);
+        return;
+      }
+    }
+  }
+
+  void RenderTechnique::updateWindow(uint32_t x, uint32_t y, uint32_t width, uint32_t height)
+  {
+    vec2 position(x, y);
+    vec2 size(width, height);
+    m_onscreenView->setViewportPosition(position);
+    m_onscreenView->setViewportSize(size);
+    m_graphics->resize(width, height);
+  }
+
+  void RenderTechnique::buildFrustumLines(shared_ptr<View> view)
+  {
+    m_clusterEntity = make_shared<Entity>("Frustum Lines");
+    shared_ptr<RenderComponent> renderComponent = make_shared<RenderComponent>("Frustum Lines");
+    vec2 viewportSize;
+    view->getViewportSize(viewportSize);
+
+    // Determine the number of X and Y tiles
+    uint32_t segmentWidth = 64;
+    uint32_t segmentHeight = 64;
+    uint32_t numXSegments = (uint32_t)viewportSize.x / segmentWidth;
+    uint32_t numYSegments = (uint32_t)viewportSize.y / segmentHeight;
+    uint32_t numZSegments = 10;
+
+    if ((uint32_t)viewportSize.x % segmentWidth != 0)
+    {
+      numXSegments++;
+    }
+    if ((uint32_t)viewportSize.y % segmentHeight != 0)
+    {
+      numYSegments++;
+    }
+    uint32_t numVerts = (numXSegments + 1) * (numYSegments + 1) * numZSegments;
+    uint32_t numClusters = numXSegments * numYSegments * (numZSegments - 1);
+
+    shared_ptr<Mesh> mesh = make_shared<Mesh>("Frustum Lines", Mesh::LINES, numVerts, 2);
+
+    float* vertexBuffer = (float*)malloc(numVerts * 3 * sizeof(float));
+    float* normalBuffer = (float*)malloc(numVerts * 3 * sizeof(float));
+
+    uint32_t* indexBuffer = (uint32_t*)malloc(numClusters * 12 * 2 * sizeof(uint32_t));
+
+    m_clusterData = (ClusterData*)malloc(sizeof(ClusterData));
+    m_clusterData->m_clusters = (Cluster*)malloc(numClusters*sizeof(Cluster));
+    m_clusterData->m_numClusterVerts = numVerts;
+    m_clusterData->m_localVerts = vertexBuffer;
+	  m_clusterData->m_numXSegments = numXSegments;
+	  m_clusterData->m_numYSegments = numYSegments;
+	  m_clusterData->m_numZSegments = numZSegments;
+    m_clusterData->m_clusterVerts = (vec3*)malloc(numVerts*sizeof(vec3));
+
+    // Get the eye and direction in world space
+    mat4 viewTransform;
+    view->getViewTransform(viewTransform);
+    mat4 invViewTransform = glm::inverse(viewTransform);
+
+    vec3 worldDirectionX = vec3(1.0f, 0.0f, 0.0f);
+    vec3 worldDirectionY = vec3(0.0f, 1.0f, 0.0f);
+    vec3 worldDirectionZ = vec3(0.0f, 0.0f, 1.0f);
+    vec3 worldEye = vec3();
+
+    //vec3 worldDirectionX = vec3(invViewTransform[0]);
+    //vec3 worldDirectionY = vec3(invViewTransform[1]);
+    //vec3 worldDirectionZ = vec3(invViewTransform[2]);
+    //vec3 worldEye = vec3(invViewTransform[3]);
+
+    float hFov = view->getFieldOfView();
+    float nearClip = view->getNearClip();
+    float farClip = view->getFarClip();
+
+    vec3 nearZ = worldEye + -worldDirectionZ * nearClip;
+    vec3 farZ = worldEye + -worldDirectionZ * farClip;
+
+    float zInc = (farClip - nearClip) / numZSegments;
+    
+    uint32_t vindex = 0;
+    uint32_t nindex = 0;
+
+    vec3 currentZ = nearZ;
+    float currentZD = nearClip;
+
+    for (uint32_t k = 0; k < numZSegments; k++)
+    {
+      float farD = tan(hFov*0.5f * (float)M_PI / 180.0f) * currentZD;
+      float currentYD = farD;
+      float xInc = farD * 2.0f / numXSegments;
+      float yInc = -farD * 2.0f / numYSegments;
+
+      for (uint32_t j = 0; j < numYSegments + 1; j++)
+      {
+        float currentXD = -farD;
+        for (uint32_t i = 0; i < numXSegments + 1; i++)
+        {
+          vec3 currentPoint = currentZ + worldDirectionX * currentXD + worldDirectionY * currentYD;
+          vertexBuffer[vindex++] = currentPoint.x;
+          vertexBuffer[vindex++] = currentPoint.y;
+          vertexBuffer[vindex++] = currentPoint.z;
+          normalBuffer[nindex++] = 0.0f;
+          normalBuffer[nindex++] = 0.0f;
+          normalBuffer[nindex++] = 1.0f;
+          currentXD += xInc;
+        }
+        currentYD += yInc;
+      }
+      currentZD += zInc;
+      currentZ = worldEye + -worldDirectionZ * currentZD;
+    }
+
+    uint32_t iindex = 0;
+    uint32_t bvindex = 0;
+    uint32_t clusterIndex = 0;
+    for (uint32_t k = 0; k < numZSegments-1; k++)
+    {
+      vindex = k * (numYSegments + 1) * (numXSegments + 1);
+      bvindex = (k+1) * (numYSegments + 1) * (numXSegments + 1);
+      for (uint32_t j = 0; j < numYSegments; j++)
+      {    
+        for (uint32_t i = 0; i < numXSegments; i++)
+        {
+          indexBuffer[iindex++] = vindex;
+          indexBuffer[iindex++] = vindex+1;
+          indexBuffer[iindex++] = vindex + 1;
+          indexBuffer[iindex++] = vindex + 1 + numXSegments + 1;
+          indexBuffer[iindex++] = vindex + 1 + numXSegments + 1;
+          indexBuffer[iindex++] = vindex + numXSegments + 1;
+          indexBuffer[iindex++] = vindex + numXSegments + 1;
+          indexBuffer[iindex++] = vindex;
+
+          indexBuffer[iindex++] = vindex;
+          indexBuffer[iindex++] = bvindex;
+          indexBuffer[iindex++] = vindex + 1;
+          indexBuffer[iindex++] = bvindex + 1;
+          indexBuffer[iindex++] = vindex + 1 + numXSegments + 1;
+          indexBuffer[iindex++] = bvindex + 1 + numXSegments + 1;
+          indexBuffer[iindex++] = vindex + numXSegments + 1;
+          indexBuffer[iindex++] = bvindex + numXSegments + 1;
+
+          indexBuffer[iindex++] = bvindex;
+          indexBuffer[iindex++] = bvindex + 1;
+          indexBuffer[iindex++] = bvindex + 1;
+          indexBuffer[iindex++] = bvindex + 1 + numXSegments + 1;
+          indexBuffer[iindex++] = bvindex + 1 + numXSegments + 1;
+          indexBuffer[iindex++] = bvindex + numXSegments + 1;
+          indexBuffer[iindex++] = bvindex + numXSegments + 1;
+          indexBuffer[iindex++] = bvindex;
+
+          m_clusterData->m_clusters[clusterIndex].m_verts[0] = vindex;
+          m_clusterData->m_clusters[clusterIndex].m_verts[1] = vindex + 1;
+          m_clusterData->m_clusters[clusterIndex].m_verts[2] = vindex + 1 + numXSegments + 1;
+          m_clusterData->m_clusters[clusterIndex].m_verts[3] = vindex + numXSegments + 1;
+          m_clusterData->m_clusters[clusterIndex].m_verts[4] = bvindex;
+          m_clusterData->m_clusters[clusterIndex].m_verts[5] = bvindex + 1;
+          m_clusterData->m_clusters[clusterIndex].m_verts[6] = bvindex + 1 + numXSegments + 1;
+          m_clusterData->m_clusters[clusterIndex].m_verts[7] = bvindex + numXSegments + 1;
+
+          vec3 p[8];
+          for (int i = 0; i < 8; i++)
+          {
+            uint32_t vertexIndex = m_clusterData->m_clusters[clusterIndex].m_verts[i] * 3;
+            p[i].x = m_clusterData->m_localVerts[vertexIndex];
+            p[i].y = m_clusterData->m_localVerts[vertexIndex +1];
+            p[i].z = m_clusterData->m_localVerts[vertexIndex +2];
+          }
+
+          m_clusterData->m_clusters[clusterIndex].m_planes[0] = planeEquation(p[0], p[3], p[2]);
+          m_clusterData->m_clusters[clusterIndex].m_planes[1] = planeEquation(p[1], p[2], p[6]);
+          m_clusterData->m_clusters[clusterIndex].m_planes[2] = planeEquation(p[5], p[6], p[7]);
+          m_clusterData->m_clusters[clusterIndex].m_planes[3] = planeEquation(p[4], p[7], p[3]);
+          m_clusterData->m_clusters[clusterIndex].m_planes[4] = planeEquation(p[1], p[5], p[4]);
+          m_clusterData->m_clusters[clusterIndex].m_planes[5] = planeEquation(p[3], p[7], p[6]);
+
+          m_clusterData->m_clusters[clusterIndex].m_lights = new vector<shared_ptr<LightComponent>>;
+          vindex++;
+          bvindex++;
+          clusterIndex++;
+        }
+        vindex++;
+        bvindex++;
+      }
+    }
+
+    mesh->addVertexBuffer(0, 3, numVerts * 3 * sizeof(float), vertexBuffer);
+    mesh->addVertexBuffer(1, 3, numVerts * 3 * sizeof(float), normalBuffer);
+    mesh->addIndexBuffer(numClusters * 12 * 2, indexBuffer);
+
+    shared_ptr<Material>material = make_shared<Material>("Frustum Lines", Material::LIT);
+    material->setAlbedoColor(vec4(1.0f, 1.0f, 1.0f, 1.0f));
+    mesh->setMaterial(material);
+
+    free(normalBuffer);
+    free(indexBuffer);
+    renderComponent->addMesh(mesh);
+    m_clusterEntity->addComponent(renderComponent);
+    m_clusterEntity->setTransform(invViewTransform);
+    m_clusterEntity->updateCompositeTransform(mat4());
+    //addRenderComponent(renderComponent, m_clusterEntity);
+  }
+
+  void RenderTechnique::setClusterEntityFreeze(bool freeze)
+  {
+    m_freezeClusterEntity = freeze;
+  }
+
+  void RenderTechnique::build()
+  {
+    for (size_t i = 0; i < m_views.size(); ++i)
+    {
+      m_graphics->createView(m_views[i]);
+    }
+
+    m_graphics->buildBuffers(m_renderComponents);
+
+    //createCompositeMeshes();
+  }
+
+  void RenderTechnique::createCompositeMeshes()
+  {
+    //shared_ptr<Mesh> mesh = make_shared<Mesh>("Composite Mesh", Mesh::TRIANGLES, 24, 1);
+    shared_ptr<Mesh> mesh = make_shared<Mesh>("Composite Mesh", Mesh::TRIANGLES, 4, 1);
+    shared_ptr<Material> material = make_shared<Material>("Composite Material", Material::DEFERRED_COMPOSITE);
+    mesh->setMaterial(material);
+
+    float verts[12] = { 1.0f, 1.0f, 0.0f, -1.0f, 1.0f, 0.0f, -1.0f,-1.0f, 0.0f,1.0f, -1.0f, 0.0f };
+    mesh->addVertexBuffer(0, 3, sizeof(float)*4 * 3, verts);
+
+   // float texCoords[8] = { 1.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f, 1.0f, 0.0f};
+   //mesh->addVertexBuffer(1, 2, sizeof(float)*4 * 2, texCoords);
+
+    unsigned int indexBuffer[6] = { 0,2,1, 2,0,3 };
+    mesh->addIndexBuffer(2 * 3, indexBuffer);
+    //float verts[24];
+    //verts[0] =  -0.5f; verts[1] =   0.5f; verts[2] =  -0.5f;
+    //verts[3] =   0.5f; verts[4] =   0.5f; verts[5] =  -0.5f;
+    //verts[6] =   0.5f; verts[7] =  -0.5f; verts[8] =  -0.5f;
+    //verts[9] =  -0.5f; verts[10] = -0.5f; verts[11] = -0.5f;
+
+    //verts[12] = -0.5f; verts[13] =  0.5f; verts[14] =  0.5f;
+    //verts[15] =  0.5f; verts[16] =  0.5f; verts[17] =  0.5f;
+    //verts[18] =  0.5f; verts[19] = -0.5f; verts[20] =  0.5f;
+    //verts[21] = -0.5f; verts[22] = -0.5f; verts[23] =  0.5f;
+
+    //mesh->addVertexBuffer(0, 3, sizeof(float) * 24 * 3, verts);
+
+    //unsigned int ib[36];
+    //ib[0] = 0; ib[1] = 1; ib[2] = 2;
+    //ib[3] = 0; ib[4] = 2; ib[5] = 3;
+
+    //ib[6] = 1; ib[7] = 5; ib[8] = 6;
+    //ib[9] = 1; ib[10] = 6; ib[11] = 2;
+
+    //ib[12] = 5; ib[13] = 4; ib[14] = 6;
+    //ib[15] = 4; ib[16] = 7; ib[17] = 6;
+
+    //ib[18] = 4; ib[19] = 0; ib[20] = 3;
+    //ib[21] = 4; ib[22] = 3; ib[23] = 7;
+
+    //ib[24] = 4; ib[25] = 5; ib[26] = 1;
+    //ib[27] = 4; ib[28] = 1; ib[29] = 0;
+
+    //ib[30] = 3; ib[31] = 2; ib[32] = 6;
+    //ib[33] = 3; ib[34] = 6; ib[35] = 7;
+    //mesh->addIndexBuffer(12 * 3, ib);
+
+    //m_graphics->createMesh(mesh);
+
+    //m_onscreenView->addCompositeMesh(mesh);
+  }
+
+  void RenderTechnique::render()
+  {
+    m_graphics->beginCommands(m_onscreenView, m_frameIndex);
+    renderMeshes(m_onscreenView, m_frameIndex);
+    m_graphics->endCommands(m_onscreenView, m_frameIndex);
+    m_graphics->executeCommands(m_onscreenView, m_frameIndex);
+
+    // Swap the buffers
+    m_graphics->present(m_onscreenView, m_frameIndex);
+    m_frameIndex++;
+  }
+
+  void RenderTechnique::updateCurrentLight(uint32_t frameIndex, int lightIndex)
+  {
+    uint32_t offset = 0;
+    uint32_t size = 0;
+    float* data = nullptr;
+
+    ivec4 lightInfo;
+    lightInfo.x = lightIndex;
+    lightInfo.y = (int)m_lightComponents.size();
+    data = (float*)glm::value_ptr(lightInfo);
+    size = sizeof(lightInfo);
+    //m_graphics->updateUniformData(m_frameDataUniformBuffers[frameIndex], offset, data, size);
+  }
+
+  void RenderTechnique::updateClusterData(shared_ptr<View> view, uint32_t frameIndex)
+  {
+    mat4 viewTransform;
+    mat4 invViewTransform;
+
+    view->getViewTransform(viewTransform);
+    invViewTransform = glm::inverse(viewTransform);
+
+    uint32_t vindex = 0;
+    for (uint32_t i = 0; i < m_clusterData->m_numClusterVerts; i++)
+    {
+      vec4 localPoint(0.0f, 0.0f, 0.0f, 1.0f);
+      localPoint.x = m_clusterData->m_localVerts[vindex++];
+      localPoint.y = m_clusterData->m_localVerts[vindex++];
+      localPoint.z = m_clusterData->m_localVerts[vindex++];
+      m_clusterData->m_clusterVerts[i] = vec3(invViewTransform * localPoint);
+    }
+
+    for (size_t i = 0; i < m_lightComponents.size(); ++i)
+    {
+      vec3 position;
+      mat4 transform;
+      m_lightComponents[i]->getPosition(position);
+      m_lightComponents[i]->getEntity(0)->getCompositeTransform(transform);
+      vec3 lightViewPosition = vec3(transform * vec4(position, 1.0f));
+      m_lightComponents[i]->setViewPosition(lightViewPosition);
+    }
+
+    size_t maxLights = 0;
+    size_t minLights = 100000;
+    size_t numZero = 0;
+    size_t totalLights = 0;
+
+    uint32_t clusterIndex = 0;
+	  for (uint32_t k = 0; k < m_clusterData->m_numZSegments-1; k++)
+	  {
+		  for (uint32_t j = 0; j < m_clusterData->m_numYSegments; j++)
+		  {
+			  for (uint32_t i = 0; i < m_clusterData->m_numXSegments; i++)
+			  {
+          vec3 p1 = m_clusterData->m_clusterVerts[m_clusterData->m_clusters[clusterIndex].m_verts[0]];
+          vec3 p2 = m_clusterData->m_clusterVerts[m_clusterData->m_clusters[clusterIndex].m_verts[1]];
+          vec3 p3 = m_clusterData->m_clusterVerts[m_clusterData->m_clusters[clusterIndex].m_verts[2]];
+          vec3 p4 = m_clusterData->m_clusterVerts[m_clusterData->m_clusters[clusterIndex].m_verts[3]];
+          vec3 p5 = m_clusterData->m_clusterVerts[m_clusterData->m_clusters[clusterIndex].m_verts[4]];
+          vec3 p6 = m_clusterData->m_clusterVerts[m_clusterData->m_clusters[clusterIndex].m_verts[5]];
+          vec3 p7 = m_clusterData->m_clusterVerts[m_clusterData->m_clusters[clusterIndex].m_verts[6]];
+          vec3 p8 = m_clusterData->m_clusterVerts[m_clusterData->m_clusters[clusterIndex].m_verts[7]];
+
+          //m_clusterData->m_clusters[clusterIndex].m_planes[0].w = updatePlaneD(m_clusterData->m_clusters[clusterIndex].m_planes[0], p1);
+          //m_clusterData->m_clusters[clusterIndex].m_planes[1].w = updatePlaneD(m_clusterData->m_clusters[clusterIndex].m_planes[1], p2);
+          //m_clusterData->m_clusters[clusterIndex].m_planes[2].w = updatePlaneD(m_clusterData->m_clusters[clusterIndex].m_planes[2], p6);
+          //m_clusterData->m_clusters[clusterIndex].m_planes[3].w = updatePlaneD(m_clusterData->m_clusters[clusterIndex].m_planes[3], p5);
+          //m_clusterData->m_clusters[clusterIndex].m_planes[4].w = updatePlaneD(m_clusterData->m_clusters[clusterIndex].m_planes[4], p2);
+          //m_clusterData->m_clusters[clusterIndex].m_planes[5].w = updatePlaneD(m_clusterData->m_clusters[clusterIndex].m_planes[5], p4);
+
+          m_clusterData->m_clusters[clusterIndex].m_planes[0] = planeEquation(p1, p4, p3);
+          m_clusterData->m_clusters[clusterIndex].m_planes[1] = planeEquation(p2, p3, p7);
+          m_clusterData->m_clusters[clusterIndex].m_planes[2] = planeEquation(p6, p7, p8);
+          m_clusterData->m_clusters[clusterIndex].m_planes[3] = planeEquation(p5, p8, p4);
+          m_clusterData->m_clusters[clusterIndex].m_planes[4] = planeEquation(p2, p6, p5);
+          m_clusterData->m_clusters[clusterIndex].m_planes[5] = planeEquation(p4, p8, p7);
+
+          m_clusterData->m_clusters[clusterIndex].m_lights->clear();
+          for (uint32_t l = 0; l < m_lightComponents.size(); l++)
+          {
+            vec3 lightViewPosition;
+            m_lightComponents[l]->getViewPosition(lightViewPosition);
+            if (intersectsCluster(clusterIndex, lightViewPosition, 25.0f))
+            {
+              m_clusterData->m_clusters[clusterIndex].m_lights->push_back(m_lightComponents[l]);
+              totalLights++;
+            }
+          }
+
+          size_t numLights = m_clusterData->m_clusters[clusterIndex].m_lights->size();
+          if (numLights == 0)
+          {
+            numZero++;
+          }
+          if (numLights > maxLights)
+          {
+            maxLights = numLights;
+          }
+          if (numLights < minLights)
+          {
+            minLights = numLights;
+          }
+          clusterIndex++;
+			  }
+		  }
+	  }
+
+    m_worldManager->printLog("MaxLights: " + std::to_string(maxLights) + ", totalLights: " + std::to_string(totalLights) + ", zeros: " + std::to_string(numZero));
+    if (!m_freezeClusterEntity)
+    {
+      m_clusterEntity->setTransform(invViewTransform);
+      m_clusterEntity->updateCompositeTransform(mat4());
+    }
+  }
+
+  vec4 RenderTechnique::planeEquation(vec3 p1, vec3 p2, vec3 p3)
+  {
+    vec4 plane;
+    vec3 v1 = glm::normalize(p3 - p2);
+    vec3 v2 = glm::normalize(p1 - p2);
+    vec3 normal = glm::normalize(glm::cross(v1, v2));
+    
+    plane.x = -normal.x;
+    plane.y = -normal.y;
+    plane.z = -normal.z;
+    plane.w = -(normal.x * p1.x + normal.y * p1.y + normal.z * p1.z);
+    return plane;
+  }
+
+  float RenderTechnique::updatePlaneD(vec4 plane, vec3 p)
+  {
+    return -(plane.x * p.x + plane.y * p.y + plane.z * p.z);
+  }
+
+  bool RenderTechnique::intersectsCluster(uint32_t clusterIndex, vec3 lightViewPosition, float radius)
+  {
+    bool intersects = true;
+    for (int i = 0; i < 6; i++)
+    {
+      vec4 plane = m_clusterData->m_clusters[clusterIndex].m_planes[i];
+      float denom = 1.0f / sqrt(plane.x * plane.x + plane.y*plane.y + plane.z*plane.z);
+      float d = (plane.x * lightViewPosition.x + plane.y * lightViewPosition.y + plane.z * lightViewPosition.z + plane.w) * denom;
+      if ((d + radius) < 0.0f)
+      {
+        return false;
+      }
+    }
+
+    return intersects;
+  }
+
+  void RenderTechnique::updateFrameData(uint32_t frameIndex)
+  {
+    mat4 transform;
+    mat4 projectionTransform;
+    mat4 viewProjection;
+    uint32_t offset = 0;
+    uint32_t size = 0;
+    float* data = nullptr;
+
+    mat4 viewMatrix;
+    mat4 lightProjection = glm::perspective(90.0f, 1.0f, 0.1f, 1000.0f);
+
+    vec3 yAxis(0.0f, -1.0f, 0.0f);
+    vec3 zAxis(0.0f, 0.0f, -1.0f);
+    vec3 center;
+
+    Light lightData;
+
+    vec4 viewPosition(0.0f, 0.0f, 0.0f, 1.0f);
+    m_onscreenView->getViewTransform(viewMatrix);
+    viewPosition = glm::inverse(viewMatrix)*viewPosition;
+
+    data = glm::value_ptr(viewPosition);
+    size = sizeof(viewPosition);
+    offset = sizeof(ivec4);
+    //m_graphics->updateUniformData(m_frameDataUniformBuffers[frameIndex], offset, data, size);
+
+    offset = 2*sizeof(ivec4);
+    for (size_t i = 0; i < m_lightComponents.size(); ++i)
+    {
+      vec3 position;
+      m_lightComponents[i]->getPosition(position);
+      m_lightComponents[i]->getEntity(0)->getCompositeTransform(transform);
+      vec3 lightWorldPosition = vec3(transform * vec4(position, 1.0f));
+
+      center = lightWorldPosition + vec3(1.0f, 0.0f, 0.0f);
+      lightData.light_view_projections[0] = lightProjection * glm::lookAt(lightWorldPosition, center, vec3(0.0, -1.0, 0.0));
+      center = lightWorldPosition + vec3(-1.0f, 0.0f, 0.0f);
+      lightData.light_view_projections[1] = lightProjection * glm::lookAt(lightWorldPosition, center, vec3(0.0, -1.0, 0.0));
+      center = lightWorldPosition + vec3(0.0f, 1.0f, 0.0f);
+      lightData.light_view_projections[2] = lightProjection * glm::lookAt(lightWorldPosition, center, vec3(0.0, 0.0, 1.0));
+      center = lightWorldPosition + vec3(0.0f, -1.0f, 0.0f);
+      lightData.light_view_projections[3] = lightProjection * glm::lookAt(lightWorldPosition, center, glm::vec3(0.0, 0.0, -1.0));
+      center = lightWorldPosition + vec3(0.0f, 0.0f, 1.0f);
+      lightData.light_view_projections[4] = lightProjection * glm::lookAt(lightWorldPosition, center, vec3(0.0, -1.0, 0.0));
+      center = lightWorldPosition + vec3(0.0f, 0.0f, -1.0f);
+      lightData.light_view_projections[5] = lightProjection * glm::lookAt(lightWorldPosition, center, vec3(0.0, -1.0, 0.0));
+
+      lightData.light_position = transform * vec4(position, 1.0f);
+
+      vec3 color;
+      m_lightComponents[i]->getDiffuse(color);
+      lightData.light_color = vec4(color.r, color.g, color.b, 1.0f);
+
+      size = sizeof(lightData);
+      //m_graphics->updateUniformData(m_frameDataUniformBuffers[frameIndex], offset, (uint8_t*)&lightData, size);
+      offset += size;
+    }
+  }
+
+  void RenderTechnique::renderMeshes(shared_ptr<View> view, uint32_t frameIndex)
+  {
+    uint32_t currentMeshIndex = 0;
+    for (size_t i = 0; i < m_renderComponents.size(); i++)
+    {
+
+      for (size_t j = 0; j < m_renderComponents[i]->numMeshes(); j++, currentMeshIndex++)
+      {
+        shared_ptr<Mesh> mesh = m_renderComponents[i]->getMesh(j);
+        m_graphics->bindPipeline(view, nullptr, frameIndex);
+        m_graphics->draw(view, mesh, mesh->getMaterial(), frameIndex);
+      }
+    }
+  }
+
+  void RenderTechnique::updateMeshData(shared_ptr<View> view, uint32_t frameIndex)
+  {
+    uint32_t currentMeshIndex = 0;
+    for (size_t i = 0; i < m_renderComponents.size(); i++)
+    {
+      for (size_t j = 0; j < m_renderComponents[i]->numMeshes(); j++, currentMeshIndex++)
+      {
+        shared_ptr<Mesh> mesh = m_renderComponents[i]->getMesh(j);
+        updateMeshData(view, mesh, m_renderComponents[i]->getEntity(0), frameIndex, currentMeshIndex);
+      }
+    }
+  }
+
+  void RenderTechnique::updateMeshData(shared_ptr<View> view, shared_ptr<Mesh> mesh, shared_ptr<Entity> entity, uint32_t frameIndex, uint32_t meshIndex)
+  {
+    uint32_t offset = m_meshOffsets[meshIndex];
+    ObjectShaderParamBlock objectData;
+    mat4 viewTransform;
+    mat4 projectionTransform;
+    size_t size = 0;
+    vec3 color;
+
+    view->getViewTransform(viewTransform);
+    view->getProjectionTransform(projectionTransform);
+    entity->getCompositeTransform(objectData.model);
+    objectData.view_projection = projectionTransform * viewTransform;
+
+    shared_ptr<Material> material = mesh->getMaterial();
+    material->getAlbedoColor(objectData.albedoColor);
+    material->getEmissiveColor(color);
+    objectData.emmisiveColor = vec4(color, 1.0f);
+    objectData.metallicRoughness.r = material->getMetallic();
+    objectData.metallicRoughness.g = material->getRoughness();
+    objectData.flags.r = material->getLightingEnable() ? 1.0f: 0.0f;
+
+    size = sizeof(objectData);
+    //m_graphics->updateUniformData(m_objectDataUniformBuffers[frameIndex], offset, (uint8_t*)&objectData, size);
+  }
+}
